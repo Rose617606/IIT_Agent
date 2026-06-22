@@ -1,0 +1,27 @@
+# 环境变量（含 API Key，不提交）
+.env
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Chroma 向量数据库
+knowledge_base/
+
+# IDE
+.vscode/
+.idea/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 临时数据文件
+data/*.pdf
+data/*.docx
+!data/.gitkeep
