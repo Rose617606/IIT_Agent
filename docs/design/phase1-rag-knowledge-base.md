@@ -1,7 +1,7 @@
 # Phase 1 技术方案：知识库构建与混合检索
 
 > 对应功能：知识库构建（build_kb.py）+ 混合检索引擎（retriever.py）
-> 版本：v1.0 | 日期：2026-06-15
+> 版本：v1.1 | 日期：2026-06-22 | 变更：GitHub 调研后增强 — 语义边界优先切片 + Query Rewrite + Hallucination Check + Top-K 调优计划 + 工具描述规范
 
 ---
 
@@ -54,11 +54,17 @@ status: active
 
 ### 3.2 切片规则
 
-1. **按段落 + 语义边界切分**：以 `\n\n` 为主要分隔，辅以 `；`、`。` 作为次要分隔
-2. **数字保护**：包含金额、百分比、日期的句子不从中切分 — 数字和单位必须在同一切片
-3. **最小/最大切片长度**：最小 30 字，最大 300 字。超出 300 字的段落用 `RecursiveCharacterTextSplitter(chunk_size=250, chunk_overlap=50)` 作为兜底
-4. **表结构特殊处理**：Markdown 表格整体保留为一个切片（不切分表格行）
-5. **章节标题保留**：每个切片前面加上所属章节标题作为上下文前缀
+1. **语义边界优先（最高原则）**：以文档结构（`\n\n` 段落 → `；`/`。` 分句）作为主切分依据。能按完整语义独立成段的，绝不强制切碎 — 不设硬性字符数上限。
+2. **数字保护**：包含金额、百分比、日期的句子不从中切分 — 数字和单位必须在同一切片。
+3. **自适应长度控制**：
+   - 最小切片：30 字（低于此值的碎片丢弃）
+   - 软上限：500 字（大部分法规条文在此范围内可自然成段）
+   - 超长段落兜底：仅当单条规则天然超过软上限时，才用 `RecursiveCharacterTextSplitter(chunk_size=450, chunk_overlap=80)` 兜底切分
+   - **设计理由**：中国税法文档差异极大（财税公告几行 vs 个税法数千字），固定上限会削足适履。优先保证"一条规则 = 一个切片"的完整性，字符数仅作软约束。
+4. **表结构特殊处理**：Markdown 表格整体保留为一个切片（不切分表格行）。
+5. **章节标题保留**：每个切片前面加上所属章节标题作为上下文前缀。
+
+> **备选参数**：软上限和 overlap 可配置（`chunk_section()` 的函数参数），Phase 4 评测时用 RAGAS 网格搜索最优值。
 
 ### 3.3 切分流程
 
@@ -288,9 +294,93 @@ def hybrid_search(query: str,
 
 ---
 
-## 7. 数据流概览
+## 7. Agent 图增强（调研借鉴）
 
-### 7.1 构建流程
+> 来源：GitHub 调研 — [inflearn-langgraph-agent](https://github.com/jasonkang14/inflearn-langgraph-agent)（韩国所得税 LangGraph Agent）、[naija-tax-ai](https://github.com/philipakintola01-sys/naija-tax-ai)（尼日利亚税法 RAG 实战）
+
+### 7.1 Query Rewrite 节点（检索前）
+
+**问题**：用户口语化查询（"我年终奖怎么搞划算"）与法规书面表述（"全年一次性奖金单独计税"）存在术语鸿沟，直接检索命中率低。
+
+**方案**：在意图识别后、检索前插入 Query Rewrite 节点，用 LLM 将口语改写为精确查询。
+
+```
+用户输入: "我年终奖怎么搞划算"
+    ↓
+意图识别 → "annual_bonus"
+    ↓
+Query Rewrite → "全年一次性奖金 单独计税 并入综合所得 对比 节税"
+    ↓
+检索（改写后的查询 + 原查询双路并行）
+```
+
+**实现要点**：
+- LLM 调用（DeepSeek），低延迟（< 500ms）
+- Prompt 约束：仅做术语对齐和关键词扩展，不改变用户意图
+- 保留原始查询并行检索，两路结果 RRF 融合（原查询覆盖面 + 改写查询精确度）
+
+### 7.2 Hallucination Check 节点（生成后）
+
+**问题**：LLM 可能编造不存在的法规条款。PRD AC-09 要求"无幻觉 — 不得编造不存在的法规条款"。
+
+**方案**：生成回答后增加 Hallucination Check 节点，逐条验证回答中的论断是否能在检索到的文档中找到原文支撑。
+
+```
+生成回答
+    ↓
+Hallucination Check:
+  对回答中每条法规论断 → 在检索上下文(Chroma chunks)中匹配原文
+    ├── 全部匹配 → 通过 → 输出回答
+    └── 存在不匹配 → 标记幻觉 → 重新生成（prompt 追加"仅使用以下文档中的信息"约束）
+                                          ↓
+                                   二次校验仍不通过 → 输出带风险提示的回答
+```
+
+**实现要点**：
+- 结构化校验：从回答中提取「法规引用 → 检索文档」映射对
+- 条件边：通过 → 输出；不通过 → 重新生成（最多 2 次）
+- 2 次重构后仍不通过：输出回答但附加"以下内容可能包含推测，请以官方文件为准"
+
+### 7.3 Top-K 参数调优计划
+
+**依据**：naija-tax-ai 实战结论 — Top-K 对检索质量的影响 > chunk 参数调参。
+
+**方案**：Phase 4 测试验证时，用 20 题测试集 + RAGAS 跑网格搜索：
+
+```python
+# 搜索空间
+DENSE_K ∈ {5, 10, 15, 20}
+SPARSE_K ∈ {5, 10, 15, 20}
+RRF_K ∈ {50, 60, 70}
+RERANK_K ∈ {3, 5, 7}
+
+# 评估指标
+context_precision, context_recall, faithfulness
+```
+
+选出最优组合作为生产参数，写入 `retriever.py` 默认值。
+
+### 7.4 工具描述规范
+
+**依据**：naija-tax-ai 实战教训 — "Tool descriptions on AI Agent nodes are more important than system prompts."
+
+**规范**：后续 `structured_tools.py` 中每个工具的 docstring 必须包含三要素：
+
+```python
+def compare_bonus_methods(annual_bonus: Decimal, monthly_salary: Decimal, ...):
+    """对比年终奖两种计税方式（单独计税 vs 并入综合所得）。
+    
+    触发条件：用户询问年终奖怎么计税、哪种方式更省税。
+    必需参数：annual_bonus（年终奖金额）、monthly_salary（月薪）
+    返回：两种方案的应纳税额、税后收入、差额、推荐方案。
+    """
+```
+
+---
+
+## 8. 数据流概览
+
+### 8.1 构建流程
 
 ```
 data/*.md                          ← 手动整理的 Markdown 政策文件
@@ -306,27 +396,34 @@ build_kb.py
     └──→ knowledge_base/sparse_index.json  ← Sparse 索引
 ```
 
-### 7.2 检索流程
+### 8.2 检索流程（含 Agent 增强）
 
 ```
 用户查询: "我月薪2万，租房，能省多少税"
     │
     ▼
 hybrid_search()
-    ├── classify_intent() → "housing_rent"
-    ├── encode_query()    → BGE-M3 出 Dense + Sparse 向量
-    ├── dense_search()    → Chroma (filter: housing_rent) → Top-10
-    ├── sparse_search()   → Sparse 索引点积匹配 → Top-10
-    ├── rrf_fusion()      → 融合 → Top-10 候选
-    ├── rerank()          → BGE-Reranker 精排 → Top-5
+    ├── classify_intent()    → "housing_rent"
+    ├── rewrite_query()      → "住房租金专项附加扣除 月薪20000 应纳税额计算"  ← 新增
+    ├── encode_query()       → BGE-M3 出 Dense + Sparse 向量（改写查询）
+    ├── encode_query()       → BGE-M3 出 Dense + Sparse 向量（原始查询）  ← 双路并行
+    ├── dense_search()       → Chroma (filter: housing_rent) → Top-10 × 2
+    ├── sparse_search()      → Sparse 索引点积匹配 → Top-10 × 2
+    ├── rrf_fusion()         → 四路融合 → Top-10 候选
+    ├── rerank()             → BGE-Reranker 精排 → Top-5
     │
     ▼
-返回: [RetrievalResult(content="住房租金扣除标准...", score=0.92, source="国发〔2018〕41号"), ...]
+Agent 生成回答
+    │
+    ▼
+check_hallucination()         ← 新增：验证回答是否 grounded 在检索文档中
+    ├── 通过 → 输出最终回答
+    └── 不通过 → 重新生成（最多 2 次）→ 仍不通过则附加风险提示输出
 ```
 
 ---
 
-## 8. 错误处理
+## 9. 错误处理
 
 | 场景 | 处理方式 |
 |------|---------|
@@ -340,7 +437,7 @@ hybrid_search()
 
 ---
 
-## 9. 依赖
+## 10. 依赖
 
 ```python
 # Embedding + Reranker（BGE 系列，MIT 开源，一个库搞定）
@@ -365,14 +462,14 @@ from datetime import date
 
 ---
 
-## 10. 待确认事项
+## 11. 待确认事项
 
 - [x] Embedding 模型：BGE-M3（Dense+Sparse 双路，替代 BM25）
 - [x] Reranker 模型：BGE-Reranker-v2-m3
 - [x] 关键词提取：**取消** — BGE-M3 Sparse + Reranker 已覆盖
 - [x] BM25：**取消** — BGE-M3 Sparse 输出替代
 - [x] LLM API：**DeepSeek** — 中文友好、性价比高，后续 Agent 层使用
-- [ ] `data/` 政策文件：最少 3 份（个人所得税法 + 专项附加扣除暂行办法 + 2023年标准更新 + 汇算清缴公告）
+- [ ] `data/` 政策文件：已完成 — 103 份法规 docx（2026-06-22 整理），待 .docx → .md 转换
 
 ---
 

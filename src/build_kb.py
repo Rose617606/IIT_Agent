@@ -25,13 +25,21 @@ _logger = logging.getLogger("build_kb")
 # ── 工具函数 ───────────────────────────────────────────
 
 def _parse_frontmatter(text: str) -> tuple[dict, str]:
-    """解析 Markdown 开头的 YAML frontmatter，返回 (meta_dict, body_text)。"""
+    """解析 Markdown 开头的 YAML frontmatter，返回 (meta_dict, body_text)。
+    容错：source 为空时默认 ""，effective_date 为空时默认 date(1900,1,1)。
+    """
+    from datetime import date as date_cls
     text = text.strip()
     if text.startswith("---"):
         parts = text.split("---", 2)
         if len(parts) >= 3:
             meta = yaml.safe_load(parts[1]) or {}
             body = parts[2].strip()
+            # 容错处理
+            if not meta.get("source"):
+                meta["source"] = ""
+            if not meta.get("effective_date"):
+                meta["effective_date"] = date_cls(1900, 1, 1)
             return meta, body
     return {}, text
 
@@ -127,10 +135,16 @@ def chunk_section(
     section_content: str,
     tax_subcategory: str,
     min_chunk_size: int = 30,
-    max_chunk_size: int = 300,
-    chunk_overlap: int = 50,
+    max_chunk_size: int = 500,   # 软上限，优先保证语义完整
+    chunk_overlap: int = 80,      # ~16% overlap
 ) -> list[Chunk]:
-    """按规则原子切分单节，返回 Chunk 列表。"""
+    """按规则原子切分单节，返回 Chunk 列表。
+
+    切片策略（设计文档 v1.1 语义边界优先）：
+    - 以文档结构（段落→分句）为主切分依据
+    - 能按完整语义独立成段的，绝不强制切碎
+    - max_chunk_size 仅作软上限，超长段落才用 RecursiveCharacterTextSplitter 兜底
+    """
     splitter = RecursiveCharacterTextSplitter(
         separators=["\n\n", "\n", "；", "。", ";", ".", "，", ",", " "],
         chunk_size=max_chunk_size,
