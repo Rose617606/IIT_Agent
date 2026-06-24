@@ -21,6 +21,12 @@ knowledge_base/
 .DS_Store
 Thumbs.db
 
+# 本地模型文件（体积大，不从 git 管理）
+models/
+
+# Playwright MCP
+.playwright-mcp/
+
 # 临时数据文件
 data/*.pdf
 data/*.docx
