@@ -451,11 +451,16 @@ def build_kb(
     # 1. 初始化 pgvector 表
     asyncio.run(_init_db(database_url))
 
-    # 2. 加载 BGE-M3（首次 ~2GB 下载）
+    # 2. 加载 BGE-M3（优先本地路径，否则从 HuggingFace 下载）
     from FlagEmbedding import BGEM3FlagModel
     if _BGE_MODEL is None:
-        _logger.info("加载 BGE-M3 模型: %s ...", model_name)
-        _BGE_MODEL = BGEM3FlagModel(model_name, use_fp16=True)
+        local_path = os.environ.get("BGE_LOCAL", "")
+        if local_path and Path(local_path).exists():
+            _logger.info("加载本地 BGE-M3: %s ...", local_path)
+            _BGE_MODEL = BGEM3FlagModel(local_path, use_fp16=True)
+        else:
+            _logger.info("加载 BGE-M3 模型: %s ...", model_name)
+            _BGE_MODEL = BGEM3FlagModel(model_name, use_fp16=True)
         _logger.info("BGE-M3 加载完成")
 
     # 3. 加载文档

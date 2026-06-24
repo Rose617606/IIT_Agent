@@ -32,11 +32,11 @@ class DocumentMeta(BaseModel):
 
 
 class ChunkMeta(BaseModel):
-    """切片级元数据，存入 Chroma metadata。"""
+    """切片级元数据，存入 pgvector metadata。"""
     chunk_id: str = Field(default_factory=lambda: uuid4().hex[:12])
     tax_subcategory: str
-    document_source: str
-    effective_date: date
+    document_source: str = ""             # build_kb 统一回填
+    effective_date: date = date(1900, 1, 1)  # build_kb 统一回填
     is_expired: bool = False
     section_title: str
     chunk_index: int = 0
