@@ -125,6 +125,100 @@ def split_by_section(doc_meta: DocumentMeta, body: str) -> list[tuple[str, str, 
     return sections
 
 
+def _detect_content_type(content: str) -> str:
+    """检测内容类型，返回 'case' | 'qa' | 'table' | 'law' | 'general'。"""
+    lines = content.split("\n")
+    # 表格类：表格行占比 > 30%
+    table_lines = sum(1 for l in lines if l.strip().startswith("|"))
+    if table_lines > len(lines) * 0.3:
+        return "table"
+    # 案例类：含【案例X】标记
+    if re.search(r"【案例[一二三四五六七八九十\d]+】", content):
+        return "case"
+    # 问答类：含 数字、标题 的 Q&A 结构
+    if re.search(r"^#\s+[一二三四五六七八九十\d]+[,、]", content, re.MULTILINE) and len(content) > 2000:
+        return "qa"
+    # 法律条文体：含大量"第X条"
+    if re.search(r"第[一二三四五六七八九十百\d]+条", content):
+        return "law"
+    return "general"
+
+
+def _extract_tables(content: str) -> tuple[str, list[str]]:
+    """从内容中提取 Markdown 表格，用占位符替换。
+    返回 (替换后的内容, 表格列表)。"""
+    lines = content.split("\n")
+    tables: list[str] = []
+    result_lines: list[str] = []
+    in_table = False
+    table_buffer: list[str] = []
+
+    for line in lines:
+        stripped = line.strip()
+        # 检测表格行：以 | 开头且包含分隔符 |---|
+        is_table_line = bool(stripped.startswith("|") and "|" in stripped[1:])
+        is_separator = bool(re.match(r"^\|[\s\-:|]+\|$", stripped))
+
+        if is_table_line or is_separator:
+            in_table = True
+            table_buffer.append(line)
+        else:
+            if in_table:
+                # 表格结束，保存
+                tables.append("\n".join(table_buffer))
+                table_buffer = []
+                in_table = False
+                result_lines.append(f"{{TABLE_{len(tables) - 1}}}")
+            result_lines.append(line)
+
+    # 收尾：最后一段如果是表格
+    if in_table and table_buffer:
+        tables.append("\n".join(table_buffer))
+        result_lines.append(f"{{TABLE_{len(tables) - 1}}}")
+
+    return "\n".join(result_lines), tables
+
+
+def _clean_content(content: str) -> str:
+    """基础清洗：去多余空行、统一换行、去页脚类噪声。"""
+    # 合并 3 个以上连续换行为 2 个
+    content = re.sub(r"\n{3,}", "\n\n", content)
+    # 去掉只有空白符的空行
+    content = re.sub(r"\n[ \t]+\n", "\n\n", content)
+    # 去常见的重复分隔线
+    content = re.sub(r"_{10,}", "", content)
+    return content.strip()
+
+
+def _table_chunk_to_text(table_str: str) -> str:
+    """将 Markdown 表格转为结构化自然语言描述。"""
+    lines = [l.strip() for l in table_str.split("\n") if l.strip()]
+    if len(lines) < 2:
+        return table_str
+
+    # 解析表头
+    headers = [h.strip() for h in lines[0].strip("|").split("|")]
+    # 跳过分隔行
+    data_start = 1
+    if re.match(r"^\|[\s\-:|]+\|$", lines[1]):
+        data_start = 2
+
+    data_rows = lines[data_start:]
+    # 转成自然语言：表头1: 值1，表头2: 值2；...
+    descriptions = []
+    for row in data_rows:
+        if not row.startswith("|"):
+            continue
+        cells = [c.strip() for c in row.strip("|").split("|")]
+        parts = []
+        for h, c in zip(headers, cells):
+            if c and c != "-":
+                parts.append(f"{h}：{c}")
+        if parts:
+            descriptions.append("；".join(parts))
+    return "。\n".join(descriptions) if descriptions else table_str
+
+
 def chunk_section(
     section_title: str,
     section_content: str,
@@ -133,29 +227,113 @@ def chunk_section(
     max_chunk_size: int = 500,
     chunk_overlap: int = 80,
 ) -> list[Chunk]:
-    """按规则原子切分单节，返回 Chunk 列表。"""
-    splitter = RecursiveCharacterTextSplitter(
-        separators=["\n\n", "\n", "；", "。", ";", ".", "，", ",", " "],
-        chunk_size=max_chunk_size,
-        chunk_overlap=chunk_overlap,
-        length_function=len,
-    )
-    raw_chunks = splitter.split_text(section_content)
+    """按规则原子切分单节 — 表格保护 + 分类型 + 清洗 + 兜底递归切分。
 
-    chunks = []
-    for i, raw in enumerate(raw_chunks):
-        raw = raw.strip()
-        if len(raw) < min_chunk_size:
-            continue
-        if len(re.sub(r'[^一-鿿]', '', raw)) < 10:
-            continue
-        prefix = section_title.strip().lstrip("#").strip()
-        content = f"[{prefix}] {raw}" if prefix else raw
-        chunks.append(Chunk(content=content, meta=ChunkMeta(
-            tax_subcategory=tax_subcategory,
+    策略（§4.1-4.3 + §6.3 + §9）：
+    1. 基础清洗：去多余空行、统一换行
+    2. 表格保护：先提取表格 → 非表格部分切分 → 表格整体作为独立 chunk
+    3. 表格内容转自然语言保留表头语义
+    4. 分类型：QA 按问答边界切，案例按【案例X】边界切，法律条文依赖 section 切
+    5. 兜底：超长段落用 RecursiveCharacterTextSplitter
+    """
+    prefix = section_title.strip().lstrip("#").strip()
+
+    # ── 1. 清洗 ──
+    content = _clean_content(section_content)
+    if len(content) < min_chunk_size:
+        return []
+
+    # ── 2. 表格保护 ──
+    content_no_tables, tables = _extract_tables(content)
+
+    chunks: list[Chunk] = []
+    chunk_idx = 0
+
+    def _make_chunk(text: str, subcat: str, idx: int) -> Chunk:
+        text = text.strip()
+        full = f"[{prefix}] {text}" if prefix else text
+        return Chunk(content=full, meta=ChunkMeta(
+            tax_subcategory=subcat,
             section_title=prefix,
-            chunk_index=i,
-        )))
+            chunk_index=idx,
+        ))
+
+    # ── 3. 表格转为独立 chunk（自然语言形式） ──
+    for table_str in tables:
+        if not table_str.strip():
+            continue
+        # 转自然语言描述
+        nl_text = _table_chunk_to_text(table_str)
+        chunks.append(_make_chunk(nl_text, tax_subcategory, chunk_idx))
+        chunk_idx += 1
+
+    # ── 4. 分类型切分非表格内容 ──
+    content_type = _detect_content_type(content_no_tables)
+    _logger.debug("内容类型: %s, 标题: %s", content_type, prefix)
+
+    if content_type in ("case", "qa"):
+        # 案例：按【案例X】边界拆分，每个案例 + 温馨提示为一块
+        segments = re.split(r"\n(?=【案例[一二三四五六七八九十\d]+】)", content_no_tables)
+        for seg in segments:
+            seg = seg.strip()
+            if len(seg) < min_chunk_size:
+                continue
+            if len(seg) <= max_chunk_size:
+                chunks.append(_make_chunk(seg, tax_subcategory, chunk_idx))
+                chunk_idx += 1
+            else:
+                # 案例太长时仅做段落切分（不切碎故事）
+                parts = seg.split("\n\n")
+                for part in parts:
+                    part = part.strip()
+                    if len(part) < min_chunk_size:
+                        continue
+                    if len(part) <= max_chunk_size:
+                        chunks.append(_make_chunk(part, tax_subcategory, chunk_idx))
+                        chunk_idx += 1
+                    else:
+                        # 兜底递归切分
+                        splitter = RecursiveCharacterTextSplitter(
+                            separators=["\n\n", "\n", "；", "。"],
+                            chunk_size=max_chunk_size, chunk_overlap=chunk_overlap,
+                            length_function=len,
+                        )
+                        for sub in splitter.split_text(part):
+                            chunks.append(_make_chunk(sub, tax_subcategory, chunk_idx))
+                            chunk_idx += 1
+    elif content_type == "law":
+        # 法律条文：已在 split_by_section 按「第X条」分割，此处只对过长段落兜底
+        if len(content_no_tables) <= max_chunk_size:
+            chunks.append(_make_chunk(content_no_tables, tax_subcategory, chunk_idx))
+            chunk_idx += 1
+        else:
+            splitter = RecursiveCharacterTextSplitter(
+                separators=["\n\n", "\n", "；", "。", ";", "."],
+                chunk_size=max_chunk_size, chunk_overlap=chunk_overlap,
+                length_function=len,
+            )
+            for sub in splitter.split_text(content_no_tables):
+                chunks.append(_make_chunk(sub, tax_subcategory, chunk_idx))
+                chunk_idx += 1
+    else:
+        # general / table: 递归切分
+        if len(content_no_tables.strip()) < min_chunk_size:
+            pass  # 跳过纯空白
+        else:
+            splitter = RecursiveCharacterTextSplitter(
+                separators=["\n\n", "\n", "；", "。", ";", ".", "，", ",", " "],
+                chunk_size=max_chunk_size, chunk_overlap=chunk_overlap,
+                length_function=len,
+            )
+            for sub in splitter.split_text(content_no_tables):
+                sub = sub.strip()
+                if len(sub) < min_chunk_size:
+                    continue
+                if len(re.sub(r'[^一-鿿]', '', sub)) < 10:
+                    continue
+                chunks.append(_make_chunk(sub, tax_subcategory, chunk_idx))
+                chunk_idx += 1
+
     return chunks
 
 
