@@ -27,7 +27,8 @@ models/
 # Playwright MCP
 .playwright-mcp/
 
-# 临时数据文件
+# 临时数据文件（原始格式，已转为 .md）
 data/*.pdf
 data/*.docx
+data/*.doc
 !data/.gitkeep
