@@ -1,13 +1,13 @@
 # Phase 1 技术方案：知识库构建与混合检索
 
 > 对应功能：知识库构建（build_kb.py）+ 混合检索引擎（retriever.py）
-> 版本：v1.1 | 日期：2026-06-22 | 变更：GitHub 调研后增强 — 语义边界优先切片 + Query Rewrite + Hallucination Check + Top-K 调优计划 + 工具描述规范
+> 版本：v1.2 | 日期：2026-06-24 | 变更：Chroma → pgvector（Supabase 托管 PostgreSQL），本地零存储依赖
 
 ---
 
 ## 1. 目标
 
-将个税政策文档（文本格式）切分成可检索的"规则原子"块，存入 Chroma 向量数据库，并提供混合检索接口供 Agent 调用。
+将个税政策文档（文本格式）切分成可检索的"规则原子"块，存入 Supabase pgvector（托管 PostgreSQL 向量扩展），并提供混合检索接口供 Agent 调用。
 
 **验收标准**：
 - 20 个测试查询的检索召回准确率 > 80%（Phase 5 评测）
@@ -126,7 +126,8 @@ build_kb.py
 ├── load_documents()          # 加载 data/*.md，解析 YAML frontmatter
 ├── split_by_section()        # 按 ## 标题分割为节，映射到 tax_subcategory
 ├── chunk_section()           # 按规则原子切分单节
-├── build_chroma()            # BGE-M3 编码 → 初始化 Chroma，批量插入切片
+├── _init_db()                # 初始化 pgvector 扩展 + 建表（Supabase）
+├── _store_chunks()           # BGE-M3 编码 → 批量写入 pgvector（Dense + Sparse）
 └── build_kb()                # 入口：编排上述流程
 ```
 
@@ -383,7 +384,7 @@ def compare_bonus_methods(annual_bonus: Decimal, monthly_salary: Decimal, ...):
 ### 8.1 构建流程
 
 ```
-data/*.md                          ← 手动整理的 Markdown 政策文件
+data/*.md                          ← Markdown 政策文件（含 YAML frontmatter）
     │
     ▼
 build_kb.py              
@@ -392,8 +393,7 @@ build_kb.py
     ├── chunk_section()            ← 规则原子切分
     ├── BGE-M3 编码 → Dense + Sparse 向量
     │
-    ├──→ knowledge_base/           ← Chroma 持久化（存 Dense 向量）
-    └──→ knowledge_base/sparse_index.json  ← Sparse 索引
+    └──→ Supabase pgvector         ← chunks 表（Dense 向量 + Sparse JSONB）
 ```
 
 ### 8.2 检索流程（含 Agent 增强）
@@ -407,8 +407,8 @@ hybrid_search()
     ├── rewrite_query()      → "住房租金专项附加扣除 月薪20000 应纳税额计算"  ← 新增
     ├── encode_query()       → BGE-M3 出 Dense + Sparse 向量（改写查询）
     ├── encode_query()       → BGE-M3 出 Dense + Sparse 向量（原始查询）  ← 双路并行
-    ├── dense_search()       → Chroma (filter: housing_rent) → Top-10 × 2
-    ├── sparse_search()      → Sparse 索引点积匹配 → Top-10 × 2
+    ├── dense_search()       → pgvector cosine distance (filter: housing_rent) → Top-10 × 2
+    ├── sparse_search()      → JSONB 稀疏索引点积匹配 → Top-10 × 2
     ├── rrf_fusion()         → 四路融合 → Top-10 候选
     ├── rerank()             → BGE-Reranker 精排 → Top-5
     │
@@ -429,9 +429,9 @@ check_hallucination()         ← 新增：验证回答是否 grounded 在检索
 |------|---------|
 | `data/` 目录为空 | 抛出 `FileNotFoundError`，提示先添加政策文件 |
 | Markdown 无 frontmatter | 跳过该文件，记录 WARNING 日志 |
-| Chroma 初始化失败 | 抛出 `RuntimeError`，检查磁盘空间和路径权限 |
+| pgvector 连接失败 | 抛出 `RuntimeError`，检查 DATABASE_URL 和网络 |
 | 检索时向量库为空 | 返回空列表 `[]`，不抛异常（Agent 层会退化为纯 LLM 回答） |
-| Sparse 索引文件不存在 | 记录 WARNING，只执行 Dense 检索，跳过融合 |
+| 稀疏索引为空 | 跳过 Sparse 检索，只执行 Dense + Reranker |
 | BGE-M3 加载失败 | 抛出 `RuntimeError`，检查模型下载和显存/内存 |
 | 意图分类无匹配 | 不过滤 `tax_subcategory`，全量检索 |
 
@@ -444,8 +444,11 @@ check_hallucination()         ← 新增：验证回答是否 grounded 在检索
 from FlagEmbedding import BGEM3FlagModel   # BGE-M3: Dense + Sparse 双路向量
 from FlagEmbedding import FlagReranker     # BGE-Reranker-v2-m3: Cross-Encoding 精排
 
-# 向量数据库
-from langchain_community.vectorstores import Chroma
+# 向量数据库（Supabase 托管 pgvector）
+from pgvector.asyncpg import register_vector  # pgvector 适配器
+import asyncpg                                 # PostgreSQL 异步驱动
+
+# 切片工具
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 # 结构化
@@ -459,6 +462,7 @@ from datetime import date
 
 > BGE-M3 本地运行，不调 OpenAI Embeddings API。`FlagEmbedding` 需安装：`pip install FlagEmbedding`。
 > 不依赖 `rank_bm25` — BGE-M3 的 Sparse 向量天然替代 BM25 关键词检索。
+> Supabase pgvector 需在 SQL Editor 执行 `CREATE EXTENSION IF NOT EXISTS vector;` 开启扩展。
 
 ---
 
@@ -469,7 +473,8 @@ from datetime import date
 - [x] 关键词提取：**取消** — BGE-M3 Sparse + Reranker 已覆盖
 - [x] BM25：**取消** — BGE-M3 Sparse 输出替代
 - [x] LLM API：**DeepSeek** — 中文友好、性价比高，后续 Agent 层使用
-- [ ] `data/` 政策文件：已完成 — 103 份法规 docx（2026-06-22 整理），待 .docx → .md 转换
+- [x] `data/` 政策文件：已完成 — 103 份法规 docx → 73 份结构化 md（2026-06-22）
+- [x] 向量数据库：**pgvector（Supabase）** — 替代本地 Chroma，与 Vercel+Render+Supabase 架构统一
 
 ---
 

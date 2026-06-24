@@ -1,23 +1,27 @@
-"""知识库构建器 — 加载政策文档 → 切片 → BGE-M3 编码 → 存入 Chroma。
+"""知识库构建器 — 加载政策文档 → 切片 → BGE-M3 编码 → 存入 Supabase pgvector。
 
 使用方式：
-    python -m src.build_kb          # 读取 data/*.md，输出到 knowledge_base/
+    python -m src.build_kb          # 读取 data/*.md，输出到 Supabase pgvector
 """
 
+import asyncio
 import json
 import logging
+import os
 import re
 from pathlib import Path
 
 import numpy as np
 import yaml
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Chroma
 
 from src.schemas import Chunk, ChunkMeta, DocumentMeta, TaxSubCategory
 
 # BGE-M3: 延迟加载，仅 build_kb() 调用时加载（避免 import 时报错）
 _BGE_MODEL = None
+
+# BGE-M3 dense 向量维度
+EMBEDDING_DIM = 1024
 
 _logger = logging.getLogger("build_kb")
 
@@ -35,7 +39,6 @@ def _parse_frontmatter(text: str) -> tuple[dict, str]:
         if len(parts) >= 3:
             meta = yaml.safe_load(parts[1]) or {}
             body = parts[2].strip()
-            # 容错处理
             if not meta.get("source"):
                 meta["source"] = ""
             if not meta.get("effective_date"):
@@ -63,7 +66,7 @@ def _resolve_tax_subcategory(heading: str) -> str:
     for keywords, category in mapping:
         if any(kw in heading for kw in keywords):
             return category.value
-    return TaxSubCategory.COMPREHENSIVE_INCOME.value  # 兜底
+    return TaxSubCategory.COMPREHENSIVE_INCOME.value
 
 
 # ── 核心函数 ───────────────────────────────────────────
@@ -88,13 +91,8 @@ def load_documents(data_dir: str = "data/") -> list[tuple[DocumentMeta, str]]:
 
 
 def split_by_section(doc_meta: DocumentMeta, body: str) -> list[tuple[str, str, str]]:
-    """按 ## 标题拆分文档为节，返回 [(section_title, content, tax_subcategory), ...]。
-
-    Returns:
-        三元组列表：(章节标题, 正文, tax_subcategory)
-    """
+    """按 ## 标题拆分文档为节，返回 [(section_title, content, tax_subcategory), ...]。"""
     sections = []
-    # 匹配 ## 标题，保留标题作为 section_title
     parts = re.split(r"^(#{1,2}\s+.+)$", body, flags=re.MULTILINE)
 
     current_title = ""
@@ -103,7 +101,6 @@ def split_by_section(doc_meta: DocumentMeta, body: str) -> list[tuple[str, str, 
     for part in parts:
         part = part.rstrip()
         if re.match(r"^#{1,2}\s+", part):
-            # 保存上一个 section
             if current_content:
                 combined = "\n".join(current_content).strip()
                 if combined:
@@ -115,14 +112,12 @@ def split_by_section(doc_meta: DocumentMeta, body: str) -> list[tuple[str, str, 
             if part.strip():
                 current_content.append(part)
 
-    # 最后一段
     if current_content:
         combined = "\n".join(current_content).strip()
         if combined:
             subcat = _resolve_tax_subcategory(current_title)
             sections.append((current_title, combined, subcat))
 
-    # 如果没有 ## 标题，整个文档作为一个 section
     if not sections:
         subcat = _resolve_tax_subcategory(doc_meta.title)
         sections.append((doc_meta.title, body.strip(), subcat))
@@ -135,16 +130,10 @@ def chunk_section(
     section_content: str,
     tax_subcategory: str,
     min_chunk_size: int = 30,
-    max_chunk_size: int = 500,   # 软上限，优先保证语义完整
-    chunk_overlap: int = 80,      # ~16% overlap
+    max_chunk_size: int = 500,
+    chunk_overlap: int = 80,
 ) -> list[Chunk]:
-    """按规则原子切分单节，返回 Chunk 列表。
-
-    切片策略（设计文档 v1.1 语义边界优先）：
-    - 以文档结构（段落→分句）为主切分依据
-    - 能按完整语义独立成段的，绝不强制切碎
-    - max_chunk_size 仅作软上限，超长段落才用 RecursiveCharacterTextSplitter 兜底
-    """
+    """按规则原子切分单节，返回 Chunk 列表。"""
     splitter = RecursiveCharacterTextSplitter(
         separators=["\n\n", "\n", "；", "。", ";", ".", "，", ",", " "],
         chunk_size=max_chunk_size,
@@ -158,50 +147,144 @@ def chunk_section(
         raw = raw.strip()
         if len(raw) < min_chunk_size:
             continue
-        # 数字保护：跳过全是数字/符号的重叠片段
         if len(re.sub(r'[^一-鿿]', '', raw)) < 10:
             continue
-        # 章节前缀拼接
         prefix = section_title.strip().lstrip("#").strip()
         content = f"[{prefix}] {raw}" if prefix else raw
         chunks.append(Chunk(content=content, meta=ChunkMeta(
             tax_subcategory=tax_subcategory,
             section_title=prefix,
             chunk_index=i,
-            # document_source / effective_date 稍后由 build_kb 统一设置
         )))
     return chunks
 
 
+# ── pgvector 数据库操作 ───────────────────────────────
+
+async def _init_db(database_url: str):
+    """初始化 pgvector 扩展和 chunks 表。"""
+    import asyncpg
+    from pgvector.asyncpg import register_vector
+
+    conn = await asyncpg.connect(database_url)
+    try:
+        await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        await register_vector(conn)
+
+        await conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS chunks (
+                id TEXT PRIMARY KEY,
+                content TEXT NOT NULL,
+                tax_subcategory TEXT,
+                document_source TEXT,
+                effective_date DATE,
+                is_expired BOOLEAN DEFAULT FALSE,
+                section_title TEXT,
+                chunk_index INTEGER,
+                embedding vector({EMBEDDING_DIM}),
+                sparse_embedding JSONB
+            )
+        """)
+        _logger.info("pgvector 表 chunks 就绪")
+    finally:
+        await conn.close()
+
+
+async def _store_chunks(database_url: str, chunks: list[Chunk], texts: list[str],
+                        dense_vecs: np.ndarray, sparse_vecs: list[dict]):
+    """批量写入切片和向量到 pgvector。"""
+    import asyncpg
+    from pgvector.asyncpg import register_vector
+
+    conn = await asyncpg.connect(database_url)
+    try:
+        await register_vector(conn)
+
+        # 清空旧数据
+        await conn.execute("DELETE FROM chunks")
+        _logger.info("已清空旧数据，开始写入 %d 条切片...", len(chunks))
+
+        # 批量插入
+        rows = []
+        for chunk, dense, sparse in zip(chunks, dense_vecs, sparse_vecs):
+            meta = chunk.meta
+            rows.append((
+                meta.chunk_id,
+                chunk.content,
+                meta.tax_subcategory,
+                meta.document_source,
+                meta.effective_date,
+                meta.is_expired,
+                meta.section_title,
+                meta.chunk_index,
+                dense.tolist(),
+                json.dumps(
+                    {str(k): round(float(v), 6) for k, v in sparse.items()}
+                ) if sparse else "{}",
+            ))
+
+        await conn.executemany("""
+            INSERT INTO chunks (id, content, tax_subcategory, document_source,
+                               effective_date, is_expired, section_title, chunk_index,
+                               embedding, sparse_embedding)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        """, rows)
+
+        count = await conn.fetchval("SELECT COUNT(*) FROM chunks")
+        _logger.info("pgvector 入库完成，共 %d 条", count)
+
+        # 数据量够大时建 IVF 索引加速检索
+        if count >= 500:
+            _logger.info("创建 IVF 索引...")
+            await conn.execute(f"""
+                CREATE INDEX IF NOT EXISTS chunks_embedding_idx
+                ON chunks USING ivfflat (embedding vector_cosine_ops)
+                WITH (lists = {min(count // 10, 200)})
+            """)
+            _logger.info("索引创建完成")
+    finally:
+        await conn.close()
+
+
+# ── 入口 ───────────────────────────────────────────────
+
 def build_kb(
     data_dir: str = "data/",
-    persist_dir: str = "knowledge_base/",
+    database_url: str | None = None,
     model_name: str = "BAAI/bge-m3",
-) -> Chroma:
-    """主入口：加载文档 → 切片 → BGE-M3 编码 → 入库。
+):
+    """主入口：加载文档 → 切片 → BGE-M3 编码 → 入库 pgvector。
 
     Args:
         data_dir: 政策 Markdown 文件目录
-        persist_dir: Chroma 持久化路径
-        model_name: BGE-M3 模型名（HuggingFace hub 或本地路径）
-
-    Returns:
-        Chroma vectorstore 实例
+        database_url: Supabase PostgreSQL 连接串（默认从环境变量 DATABASE_URL 读取）
+        model_name: BGE-M3 模型名
     """
     global _BGE_MODEL
 
-    # 1. 延迟加载 BGE-M3（首次加载会自动下载 ~2GB）
+    # 数据库连接
+    if database_url is None:
+        from dotenv import load_dotenv
+        load_dotenv()
+        database_url = os.environ["DATABASE_URL"]
+    if not database_url:
+        raise RuntimeError("未配置 DATABASE_URL，请在 .env 中设置 Supabase 连接串")
+
+    # 1. 初始化 pgvector 表
+    asyncio.run(_init_db(database_url))
+
+    # 2. 加载 BGE-M3（首次 ~2GB 下载）
     from FlagEmbedding import BGEM3FlagModel
     if _BGE_MODEL is None:
         _logger.info("加载 BGE-M3 模型: %s ...", model_name)
         _BGE_MODEL = BGEM3FlagModel(model_name, use_fp16=True)
         _logger.info("BGE-M3 加载完成")
 
-    # 2. 加载文档
+    # 3. 加载文档
     docs = load_documents(data_dir)
     _logger.info("共加载 %d 份文档", len(docs))
 
-    # 3. 切分
+    # 4. 切分
     all_chunks: list[Chunk] = []
     for doc_meta, body in docs:
         sections = split_by_section(doc_meta, body)
@@ -218,46 +301,17 @@ def build_kb(
     if not all_chunks:
         raise RuntimeError("未生成任何切片，请检查 data/ 中的文件内容")
 
-    # 4. BGE-M3 编码
+    # 5. BGE-M3 编码
     texts = [ch.content for ch in all_chunks]
-    meta_dicts = [ch.meta.model_dump() for ch in all_chunks]
-    ids = [ch.meta.chunk_id for ch in all_chunks]
-
-    # 日期字段转字符串（Chroma metadata 要求）
-    for md in meta_dicts:
-        md["effective_date"] = str(md["effective_date"])
-
     _logger.info("BGE-M3 编码 %d 个切片 (dense + sparse) ...", len(texts))
     output = _BGE_MODEL.encode(texts, return_dense=True, return_sparse=True, batch_size=32)
     dense_vecs = np.array(output["dense_vecs"], dtype=np.float32)
     sparse_vecs = output.get("lexical_weights", [])
 
-    # 5. 存入 Chroma
-    persist_path = Path(persist_dir)
-    persist_path.mkdir(parents=True, exist_ok=True)
+    # 6. 存入 pgvector
+    asyncio.run(_store_chunks(database_url, all_chunks, texts, dense_vecs, sparse_vecs))
 
-    # 清空旧数据
-    if list(persist_path.iterdir()):
-        import shutil
-        shutil.rmtree(persist_path)
-        persist_path.mkdir()
-
-    chroma = Chroma(persist_directory=str(persist_path), embedding_function=None)
-    # 手动插入预计算的 embedding（Chroma 支持 add_embeddings）
-    chroma.add_texts(texts=texts, metadatas=meta_dicts, ids=ids, embeddings=dense_vecs)
-    _logger.info("Chroma 入库完成，路径: %s", persist_path.absolute())
-
-    # 6. 存储 Sparse 索引
-    sparse_index = {}
-    for chunk_id, sw in zip(ids, sparse_vecs):
-        # sw 格式: {token_id: weight, ...} 的 dict
-        sparse_index[chunk_id] = {str(k): float(v) for k, v in sw.items()}
-
-    sparse_path = persist_path / "sparse_index.json"
-    sparse_path.write_text(json.dumps(sparse_index, ensure_ascii=False, indent=2), encoding="utf-8")
-    _logger.info("Sparse 索引入库: %s", sparse_path)
-
-    return chroma
+    _logger.info("知识库构建完成！")
 
 
 if __name__ == "__main__":
