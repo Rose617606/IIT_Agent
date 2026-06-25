@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
-from src.schemas import INTENT_KEYWORDS, RetrievalResult
+from src.schemas import RetrievalResult, classify_text
 
 _logger = logging.getLogger("retriever")
 
@@ -112,14 +112,11 @@ class Retriever:
 
     @staticmethod
     def classify_intent(query: str) -> str | None:
-        """关键词匹配 → tax_subcategory，无匹配返回 None（全量检索）。"""
-        all_keywords = [(kw, cat) for cat, kws in INTENT_KEYWORDS.items() for kw in kws]
-        all_keywords.sort(key=lambda x: -len(x[0]))
+        """关键词匹配 → tax_subcategory，无匹配返回 None（全量检索）。
 
-        for keyword, category in all_keywords:
-            if keyword in query:
-                return category
-        return None
+        统一使用 schemas.classify_text()，建库端与检索端共用同一份关键词表。
+        """
+        return classify_text(query)
 
     # ── 编码 ───────────────────────────────────────────
 

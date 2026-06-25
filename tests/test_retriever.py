@@ -21,7 +21,8 @@ class TestClassifyIntent:
         ("大病医疗报销后还能扣吗", TaxSubCategory.MAJOR_MEDICAL.value),
         ("继续教育考证能扣吗", TaxSubCategory.CONTINUING_EDUCATION.value),
         ("个税税率是多少", TaxSubCategory.TAX_RATE.value),
-        ("综合所得年度汇算", TaxSubCategory.COMPREHENSIVE_INCOME.value),
+        ("综合所得年度汇算", TaxSubCategory.ANNUAL_SETTLEMENT.value),
+        ("工资薪金怎么算税", TaxSubCategory.COMPREHENSIVE_INCOME.value),
         ("今天天气真好", None),  # 无匹配
     ])
     def test_classify(self, query, expected):

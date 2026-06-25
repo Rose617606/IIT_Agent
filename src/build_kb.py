@@ -47,32 +47,51 @@ def _parse_frontmatter(text: str) -> tuple[dict, str]:
     return {}, text
 
 
-def _resolve_tax_subcategory(heading: str) -> str:
-    """根据章节标题映射到 tax_subcategory。"""
-    heading = heading.strip().lstrip("#").strip()
-    mapping = [
-        (["子女教育", "婴幼儿", "3岁以下"], TaxSubCategory.CHILD_EDUCATION),
-        (["继续教育"], TaxSubCategory.CONTINUING_EDUCATION),
-        (["大病医疗"], TaxSubCategory.MAJOR_MEDICAL),
-        (["住房贷款利息", "住房贷款"], TaxSubCategory.HOUSING_LOAN),
-        (["住房租金", "租房", "房租"], TaxSubCategory.HOUSING_RENT),
-        (["赡养老人", "赡养"], TaxSubCategory.ELDERLY_SUPPORT),
-        (["婴幼儿照护", "婴儿"], TaxSubCategory.INFANT_CARE),
-        (["年终奖", "一次性奖金", "全年一次性"], TaxSubCategory.ANNUAL_BONUS),
-        (["综合所得", "应纳税所得额", "税率"], TaxSubCategory.COMPREHENSIVE_INCOME),
-        (["汇算清缴", "年度汇算"], TaxSubCategory.ANNUAL_SETTLEMENT),
-        (["免税", "免征", "减征"], TaxSubCategory.BASIC_DEDUCTION),
-    ]
-    for keywords, category in mapping:
-        if any(kw in heading for kw in keywords):
-            return category.value
+def _classify_section(
+    section_title: str,
+    section_content: str,
+    doc_title: str,
+    filename: str,
+) -> str:
+    """五层兜底分类 — 在完整节语义上扫描关键词。
+
+    优先级：
+    1. 章节标题 → classify_text
+    2. 整节内容前 500 字 → classify_text
+    3. frontmatter title → classify_text
+    4. 文件名 → classify_text
+    5. 兜底 → comprehensive_income
+    """
+    from src.schemas import classify_text
+
+    # 第1层：章节标题
+    result = classify_text(section_title)
+    if result:
+        return result
+
+    # 第2层：整节内容（前500字，语义最完整）
+    result = classify_text(section_content[:500])
+    if result:
+        return result
+
+    # 第3层：文档 title
+    result = classify_text(doc_title)
+    if result:
+        return result
+
+    # 第4层：文件名
+    result = classify_text(filename)
+    if result:
+        return result
+
+    # 第5层：兜底
     return TaxSubCategory.COMPREHENSIVE_INCOME.value
 
 
 # ── 核心函数 ───────────────────────────────────────────
 
-def load_documents(data_dir: str = "data/") -> list[tuple[DocumentMeta, str]]:
-    """加载 data/*.md 文件，解析 frontmatter，返回 (DocumentMeta, 正文)。"""
+def load_documents(data_dir: str = "data/") -> list[tuple[DocumentMeta, str, str]]:
+    """加载 data/*.md 文件，解析 frontmatter，返回 (DocumentMeta, 正文, 文件名)。"""
     data_path = Path(data_dir)
     if not data_path.exists() or not list(data_path.glob("*.md")):
         raise FileNotFoundError(f"data/ 目录为空或不存在，请先放入 Markdown 政策文件。路径: {data_path.absolute()}")
@@ -85,13 +104,13 @@ def load_documents(data_dir: str = "data/") -> list[tuple[DocumentMeta, str]]:
             _logger.warning("跳过无 frontmatter 的文件: %s", md_file.name)
             continue
         meta = DocumentMeta(**frontmatter)
-        docs.append((meta, body))
+        docs.append((meta, body, md_file.name))
         _logger.info("已加载: %s (%s)", meta.title, meta.source)
     return docs
 
 
-def split_by_section(doc_meta: DocumentMeta, body: str) -> list[tuple[str, str, str]]:
-    """按 ## 标题拆分文档为节，返回 [(section_title, content, tax_subcategory), ...]。"""
+def split_by_section(doc_meta: DocumentMeta, body: str, filename: str = "") -> list[tuple[str, str, str]]:
+    """按 ## 标题拆分文档为节，在完整节上做分类，返回 [(section_title, content, tax_subcategory), ...]。"""
     sections = []
     parts = re.split(r"^(#{1,2}\s+.+)$", body, flags=re.MULTILINE)
 
@@ -104,7 +123,9 @@ def split_by_section(doc_meta: DocumentMeta, body: str) -> list[tuple[str, str, 
             if current_content:
                 combined = "\n".join(current_content).strip()
                 if combined:
-                    subcat = _resolve_tax_subcategory(current_title)
+                    subcat = _classify_section(
+                        current_title, combined, doc_meta.title, filename,
+                    )
                     sections.append((current_title, combined, subcat))
             current_title = part
             current_content = []
@@ -115,11 +136,13 @@ def split_by_section(doc_meta: DocumentMeta, body: str) -> list[tuple[str, str, 
     if current_content:
         combined = "\n".join(current_content).strip()
         if combined:
-            subcat = _resolve_tax_subcategory(current_title)
+            subcat = _classify_section(
+                current_title, combined, doc_meta.title, filename,
+            )
             sections.append((current_title, combined, subcat))
 
     if not sections:
-        subcat = _resolve_tax_subcategory(doc_meta.title)
+        subcat = _classify_section(doc_meta.title, body.strip(), doc_meta.title, filename)
         sections.append((doc_meta.title, body.strip(), subcat))
 
     return sections
@@ -467,10 +490,10 @@ def build_kb(
     docs = load_documents(data_dir)
     _logger.info("共加载 %d 份文档", len(docs))
 
-    # 4. 切分
+    # 4. 切分（传入文件名用于五层兜底分类）
     all_chunks: list[Chunk] = []
-    for doc_meta, body in docs:
-        sections = split_by_section(doc_meta, body)
+    for doc_meta, body, filename in docs:
+        sections = split_by_section(doc_meta, body, filename=filename)
         for section_title, section_content, tax_subcategory in sections:
             chunks = chunk_section(section_title, section_content, tax_subcategory)
             for ch in chunks:

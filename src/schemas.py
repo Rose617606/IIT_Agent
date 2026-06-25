@@ -59,18 +59,34 @@ class RetrievalResult(BaseModel):
     score: float = 0.0
 
 
-# 意图分类触发词表（长词优先，多命中取首个匹配）
+# 意图分类触发词表（长词优先，多命中取最长匹配）
 INTENT_KEYWORDS: dict[str, list[str]] = {
     TaxSubCategory.CHILD_EDUCATION.value:       ["子女教育", "孩子上学", "小孩读书", "学费扣除", "学前教育"],
-    TaxSubCategory.CONTINUING_EDUCATION.value:  ["继续教育", "学历提升", "考证", "职业资格", "在职教育", "成人教育"],
+    TaxSubCategory.CONTINUING_EDUCATION.value:  ["继续教育", "学历提升", "考证", "职业资格", "在职教育", "成人教育", "学历教育"],
     TaxSubCategory.MAJOR_MEDICAL.value:         ["大病医疗", "医保报销", "医药费", "住院", "自付医疗"],
-    TaxSubCategory.HOUSING_LOAN.value:          ["房贷利息", "房贷", "首套住房", "贷款买房", "住房贷款", "公积金贷款"],
-    TaxSubCategory.HOUSING_RENT.value:          ["租房", "房租", "租金扣除", "租房支出"],
+    TaxSubCategory.HOUSING_LOAN.value:          ["房贷利息", "首套住房", "贷款买房", "住房贷款利息", "住房贷款", "公积金贷款"],
+    TaxSubCategory.HOUSING_RENT.value:          ["住房租金", "租房支出", "租金扣除", "租房", "房租"],
     TaxSubCategory.ELDERLY_SUPPORT.value:       ["赡养老人", "赡养父母", "养老扣除", "独生子女老人"],
-    TaxSubCategory.INFANT_CARE.value:           ["婴幼儿", "3岁以下", "育儿", "婴儿照护", "幼儿照护"],
-    TaxSubCategory.ANNUAL_BONUS.value:          ["年终奖", "奖金计税", "单独计税", "全年一次性奖金"],
-    TaxSubCategory.COMPREHENSIVE_INCOME.value:  ["综合所得", "年度汇算", "汇算清缴", "工资薪金", "劳务报酬"],
-    TaxSubCategory.ANNUAL_SETTLEMENT.value:     ["汇算清缴办法", "退税流程", "补税", "年度申报"],
+    TaxSubCategory.INFANT_CARE.value:           ["婴幼儿照护", "幼儿照护", "婴儿照护", "3岁以下婴幼儿", "3岁以下", "婴幼儿", "育儿"],
+    TaxSubCategory.ANNUAL_BONUS.value:          ["全年一次性奖金", "年终奖", "奖金计税", "单独计税"],
+    TaxSubCategory.COMPREHENSIVE_INCOME.value:  ["综合所得", "工资薪金", "劳务报酬", "稿酬", "特许权使用费", "应纳税所得额"],
+    TaxSubCategory.ANNUAL_SETTLEMENT.value:     ["综合所得汇算清缴", "综合所得年度汇算", "汇算清缴", "退税流程", "补税", "年度申报", "年度汇算"],
     TaxSubCategory.TAX_RATE.value:              ["税率表", "超额累进", "速算扣除数", "个税税率"],
-    TaxSubCategory.BASIC_DEDUCTION.value:       ["起征点", "基本减除", "免征额", "6万元", "5000元"],
+    TaxSubCategory.BASIC_DEDUCTION.value:       ["基本减除费用", "基本减除", "起征点", "免征额", "6万元", "5000元"],
 }
+
+
+def classify_text(text: str) -> str | None:
+    """在文本中扫描关键词表，长词优先返回对应的 tax_subcategory。
+
+    建库端（build_kb）和检索端（retriever）共用此函数。
+    返回 None 表示未命中任何关键词，调用方自行兜底。
+    """
+    best_category = None
+    best_len = 0
+    for category, kw_list in INTENT_KEYWORDS.items():
+        for kw in kw_list:
+            if kw in text and len(kw) > best_len:
+                best_category = category
+                best_len = len(kw)
+    return best_category
