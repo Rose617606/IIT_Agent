@@ -32,3 +32,10 @@ data/*.pdf
 data/*.docx
 data/*.doc
 !data/.gitkeep
+.claude/
+
+# 文档与临时笔记（不从 git 管理）
+docs/
+嵌入策略.md
+未检索的回答.md
+*.md.tmp
