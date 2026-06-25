@@ -1,7 +1,7 @@
 # Phase 1 技术方案：知识库构建与混合检索
 
 > 对应功能：知识库构建（build_kb.py）+ 混合检索引擎（retriever.py）
-> 版本：v1.2 | 日期：2026-06-24 | 变更：Chroma → pgvector（Supabase 托管 PostgreSQL），本地零存储依赖
+> 版本：v1.3 | 日期：2026-06-25 | 变更：切片分类策略 — 完整节分类+统一关键词表（建库与检索共用 schemas.INTENT_KEYWORDS）
 
 ---
 
@@ -66,19 +66,29 @@ status: active
 
 > **备选参数**：软上限和 overlap 可配置（`chunk_section()` 的函数参数），Phase 4 评测时用 RAGAS 网格搜索最优值。
 
-### 3.3 切分流程
+### 3.3 切分流程（含分类）
 
 ```
 加载 MD 文件 → 解析 YAML frontmatter → 提取全局元数据
     ↓
-按 ## 标题分割为"节"（每节 = 一个 tax_subcategory）
+按 ## 标题分割为"节"（每节 = 完整语义段落）
     ↓
-每节内按段落 + 语义边界递归切分
+【分类阶段 — 对完整节打 tax_subcategory 标签】
+  优先级：章节标题 > 整节内容 > frontmatter title > 文件名 > 兜底 comprehensive_income
+  使用 schemas.INTENT_KEYWORDS 统一关键词表（建库与检索共用）
+    ↓
+每节切分 → 所有子切片继承该节的 tax_subcategory（保证标签一致性）
     ↓
 数字保护检查 → 过长的段落用 RecursiveCharacterTextSplitter 兜底
     ↓
-生成切片级元数据 → 拼接章节前缀 → 存入 Chroma
+生成切片级元数据 → 拼接章节前缀 → 回填 document_source/effective_date → 存入 pgvector
 ```
+
+**关键设计决策（v1.3）：分类必须在完整节上做，不在碎片上做。**
+- 切片正文已被切碎（如"一个纳税年度内不可变更"），独立的碎片扫不出业务关键词
+- 完整节内容语义连贯，分类准确性远高于碎片扫描
+- 一节内所有子切片继承统一标签，避免"同节三碎片各打不同标签"的混乱
+- 建库和检索共用 `schemas.INTENT_KEYWORDS`，一份关键词表，定义一次
 
 ---
 
@@ -276,22 +286,34 @@ def hybrid_search(query: str,
 
 ### 6.4 意图识别策略
 
-不依赖 LLM（降低延迟），使用关键词匹配：
+不依赖 LLM（降低延迟），使用关键词匹配。**关键词表统一定义在 `schemas.py` 的 `INTENT_KEYWORDS`，建库端 `build_kb.py` 和检索端 `retriever.py` 共用同一份，改一处生效两端。**
+
+#### 两层关键词策略
+
+基于 74 份文档实际内容分析，关键词表分两层：
+
+**第一层：首发核心 12 类**（独立子类，直接用于检索预过滤）
 
 | tax_subcategory | 触发词 |
 |-----------------|--------|
-| child_education | 子女教育、孩子上学、小孩读书、学费扣除 |
-| continuing_education | 继续教育、学历提升、考证、职业资格 |
-| major_medical | 大病医疗、医保、医药费、住院 |
-| housing_loan | 房贷利息、首套住房、贷款买房 |
-| housing_rent | 租房、房租、租金扣除 |
-| elderly_support | 赡养老人、父母、养老 |
-| infant_care | 婴幼儿、3岁以下、育儿 |
-| annual_bonus | 年终奖、奖金计税、单独计税 |
-| comprehensive_income | 综合所得、汇算清缴、年度汇算 |
-| tax_rate | 税率、税率表、速算扣除数 |
+| child_education | 子女教育、孩子上学、小孩读书、学费扣除、学前教育 |
+| continuing_education | 继续教育、学历提升、考证、职业资格、在职教育 |
+| major_medical | 大病医疗、医保报销、医药费、住院、自付医疗 |
+| housing_loan | 房贷利息、房贷、首套住房、贷款买房、住房贷款 |
+| housing_rent | 租房、房租、租金扣除、住房租金 |
+| elderly_support | 赡养老人、赡养父母、养老扣除、独生子女老人 |
+| infant_care | 婴幼儿、3岁以下、育儿、婴儿照护、幼儿照护 |
+| annual_bonus | 年终奖、奖金计税、单独计税、全年一次性奖金 |
+| comprehensive_income | 综合所得、工资薪金、劳务报酬、稿酬、应纳税所得额 |
+| tax_rate | 税率表、超额累进、速算扣除数、个税税率 |
+| annual_settlement | 汇算清缴办法、退税流程、补税、年度申报、年度汇算 |
+| basic_deduction | 起征点、基本减除、免征额、6万元、5000元 |
 
-匹配原则：长词优先，多命中时取第一个匹配的类别。
+**第二层：扩容储备**（暂不建独立子类，兜底归入 `comprehensive_income`）
+
+文档覆盖但首发场景用不到的专题：股权激励、新三板股息红利、储蓄存款利息、限售股、沪港通/深港通、外籍个人/非居民、远洋船员、粤港澳大湾区/海南自贸港、育儿补贴、个体工商户减半征收、公益慈善捐赠、疫情防控等。
+
+> **设计理由**：首发 20 题聚焦综合所得+专项附加扣除+年终奖，建一堆没人查的独立子类只会稀释检索精度。后续需求驱动扩展时，只需在 `schemas.py` 加枚举值+触发词，两端自动生效。
 
 ---
 
@@ -475,6 +497,7 @@ from datetime import date
 - [x] LLM API：**DeepSeek** — 中文友好、性价比高，后续 Agent 层使用
 - [x] `data/` 政策文件：已完成 — 103 份法规 docx → 73 份结构化 md（2026-06-22）
 - [x] 向量数据库：**pgvector（Supabase）** — 替代本地 Chroma，与 Vercel+Render+Supabase 架构统一
+- [x] 切片分类策略（v1.3）：**完整节分类 + 统一关键词表** — 在 `split_by_section()` 阶段用完整语义段落扫关键词，子切片继承标签；`schemas.INTENT_KEYWORDS` 建库和检索共用
 
 ---
 
@@ -495,3 +518,12 @@ class TaxSubCategory(str, Enum):
     ANNUAL_SETTLEMENT = "annual_settlement"      # 汇算清缴
     BASIC_DEDUCTION = "basic_deduction"          # 基本减除费用
 ```
+
+## 版本历史
+
+| 版本 | 日期 | 变更 |
+|------|------|------|
+| v1.0 | 2026-06-15 | 初版：Chroma + BM25 + BGE-M3 |
+| v1.1 | 2026-06-23 | BM25 取消（BGE-M3 Sparse 替代），Reranker 从 none → BGE-Reranker-v2-m3 |
+| v1.2 | 2026-06-24 | Chroma → pgvector（Supabase），本地零存储依赖 |
+| v1.3 | 2026-06-25 | 切片分类策略重构：完整节分类 + 统一关键词表（schemas.INTENT_KEYWORDS），建库与检索共用 |
