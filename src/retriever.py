@@ -10,13 +10,18 @@ import asyncio
 import json
 import logging
 import os
+import threading
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import numpy as np
 
 from src.schemas import RetrievalResult, classify_text
 
 _logger = logging.getLogger("retriever")
+
+# 模块级线程池，避免 _run_async 每次调用创建/销毁 executor
+_executor = ThreadPoolExecutor(max_workers=4)
 
 
 def _run_async(coro):
@@ -25,10 +30,9 @@ def _run_async(coro):
         loop = asyncio.get_running_loop()
     except RuntimeError:
         return asyncio.run(coro)
-    # 已在异步上下文中，用线程池隔离
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(asyncio.run, coro)
-        return future.result()
+    # 已在异步上下文中，用线程池隔离（复用模块级 executor）
+    future = _executor.submit(asyncio.run, coro)
+    return future.result()
 
 
 class Retriever:
@@ -37,28 +41,52 @@ class Retriever:
     def __init__(self, database_url: str):
         self._database_url = database_url
         self._conn = None  # 延迟连接
-        self._sparse_index: dict[str, dict[str, float]] = {}
+        self._sparse_index: dict[str, dict[str, float]] | None = None  # None=未加载
 
-        # 延迟加载模型
+        # 延迟加载模型（优先本地路径）
+        local_path = os.environ.get("BGE_LOCAL", "")
+        if local_path and Path(local_path).exists():
+            self._model_name = local_path
+        else:
+            self._model_name = "BAAI/bge-m3"
         self._bge_model = None
         self._reranker = None
-        self._model_name = "BAAI/bge-m3"
+        self._model_lock = threading.Lock()
 
     # ── 数据库连接 ─────────────────────────────────────
 
     async def _get_conn(self):
-        """获取或创建数据库连接。"""
-        if self._conn is None:
-            import asyncpg
-            from pgvector.asyncpg import register_vector
+        """获取或创建数据库连接。检测 event loop 变化时自动重连。"""
+        import asyncpg
+        from pgvector.asyncpg import register_vector
 
-            self._conn = await asyncpg.connect(self._database_url)
-            await register_vector(self._conn)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if self._conn is not None:
+            # event loop 变了（Gradio 内部线程切换），关闭旧连接
+            if loop is not None and getattr(self, "_conn_loop_id", None) != id(loop):
+                try:
+                    await self._conn.close()
+                except Exception:
+                    pass
+                self._conn = None
+            else:
+                return self._conn
+
+        self._conn = await asyncpg.connect(self._database_url)
+        await register_vector(self._conn)
+        if loop is not None:
+            self._conn_loop_id = id(loop)
         return self._conn
 
     async def _ensure_sparse_index(self):
-        """加载稀疏索引到内存。"""
-        if self._sparse_index:
+        """加载稀疏索引到内存（首次调用从 DB 加载，后续复用）。
+        None=未加载，空dict=已加载但库为空，不再重复查询。
+        """
+        if self._sparse_index is not None:
             return
         conn = await self._get_conn()
         rows = await conn.fetch("SELECT id, sparse_embedding FROM chunks")
@@ -88,25 +116,43 @@ class Retriever:
             raise RuntimeError("未配置 DATABASE_URL，请在 .env 中设置 Supabase 连接串")
 
         retriever = cls(database_url)
-        # 预加载稀疏索引
-        _run_async(retriever._ensure_sparse_index())
+        # 稀疏索引改为懒加载（首次 search() 时加载），避免 from_database 阻塞启动
         return retriever
 
     # ── 模型加载 ───────────────────────────────────────
 
     def _ensure_models(self):
-        """延迟加载 BGE-M3 和 Reranker（首次检索时加载，~3-5 GB 内存）。"""
-        if self._bge_model is None:
+        """延迟加载 BGE-M3 和 Reranker（首次检索时加载，~3-5 GB 内存）。
+
+        加锁防止并发首次请求重复加载导致 OOM。
+        """
+        if self._bge_model is not None:
+            return
+
+        with self._model_lock:
+            # 双检：拿到锁后再次确认（其他线程可能已加载完）
+            if self._bge_model is not None:
+                return
+
             from FlagEmbedding import BGEM3FlagModel, FlagReranker
 
-            _logger.info("加载 BGE-M3 模型: %s ...", self._model_name)
+            _logger.info("加载 BGE-M3: %s ...", self._model_name)
             self._bge_model = BGEM3FlagModel(self._model_name, use_fp16=True)
             _logger.info("BGE-M3 加载完成")
 
-            reranker_name = "BAAI/bge-reranker-v2-m3"
-            _logger.info("加载 BGE-Reranker: %s ...", reranker_name)
-            self._reranker = FlagReranker(reranker_name, use_fp16=True)
-            _logger.info("BGE-Reranker 加载完成")
+            # Reranker：检查本地路径
+            reranker_local = os.environ.get("RERANKER_LOCAL", "")
+            if reranker_local and Path(reranker_local).exists():
+                reranker_name = reranker_local
+            else:
+                reranker_name = "BAAI/bge-reranker-v2-m3"
+            try:
+                _logger.info("加载 BGE-Reranker: %s ...", reranker_name)
+                self._reranker = FlagReranker(reranker_name, use_fp16=True)
+                _logger.info("BGE-Reranker 加载完成")
+            except Exception as e:
+                _logger.warning("Reranker 加载失败，将跳过精排: %s", e)
+                self._reranker = None
 
     # ── 意图分类 ───────────────────────────────────────
 
@@ -261,11 +307,14 @@ class Retriever:
 
     def _rerank(self, query: str, candidates: list[RetrievalResult],
                 top_k: int = 5) -> list[RetrievalResult]:
-        """BGE-Reranker Cross-Encoding 精排。"""
+        """BGE-Reranker Cross-Encoding 精排（reranker 不可用时退化为直接返回候选）。"""
         if not candidates:
             return []
 
         self._ensure_models()
+        if self._reranker is None:
+            return candidates[:top_k]
+
         pairs = [[query, c.content] for c in candidates]
         scores = self._reranker.compute_score(pairs, normalize=True)
 
@@ -289,7 +338,8 @@ class Retriever:
         # 3. Dense 检索
         dense_results = self._dense_search(dense_vec, k=10, filter_cat=intent)
 
-        # 4. Sparse 检索
+        # 4. Sparse 检索（首次调用懒加载稀疏索引）
+        _run_async(self._ensure_sparse_index())
         if self._sparse_index:
             sparse_scores = self._sparse_search(sparse_vec, k=10)
             sparse_results = self._sparse_scores_to_results(sparse_scores, k=10)
