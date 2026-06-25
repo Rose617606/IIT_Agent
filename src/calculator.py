@@ -68,11 +68,15 @@ def calc_annual_tax(
 
 
 def _calc_bonus_tax_separate(annual_bonus: Decimal) -> Decimal:
-    """年终奖单独计税：奖金/12 → 查月税率表 → 应纳税额 = 奖金 × 税率 - 速算扣除数。"""
+    """年终奖单独计税：奖金/12 查月税率表确定税率和速算扣除数，
+    然后 应纳税额 = 奖金 × 税率 - 速算扣除数（税率应用于全年奖金，非月均额）。"""
     if annual_bonus <= 0:
         return Decimal("0")
-    monthly = (annual_bonus / Decimal("12")).quantize(Decimal("0.01"))
-    return _calc_tax_from_brackets(monthly, _MONTHLY_BRACKETS)
+    monthly = annual_bonus / Decimal("12")
+    for ceiling, rate, quick_deduction in _MONTHLY_BRACKETS:
+        if monthly <= ceiling or ceiling == Decimal("inf"):
+            return (annual_bonus * rate - quick_deduction).quantize(Decimal("0.01"))
+    return Decimal("0")
 
 
 def compare_bonus_methods(
